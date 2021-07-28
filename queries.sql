@@ -131,3 +131,19 @@ SELECT location, population,
 	   ROUND(100*total_vaccinations/population,4) vaccination_percentage
 FROM present_country_totals
 ORDER BY infection_percentage DESC, death_percentage DESC;
+
+-- Getting percentages of people vaccinated per country
+SELECT pct.location, ROUND(100*tv.people_fully_vaccinated/pct.population,4) percent_vaccinated
+FROM present_country_totals pct
+	INNER JOIN tests_vaccinations tv
+	ON pct.location=tv.location AND tv.date='2021-07-17'
+ORDER BY percent_vaccinated DESC;
+
+-- Get vaccination rates of each country (wrt population) over week of '2021-07-10' -> '2021-07-17'
+SELECT pct.location,
+	   AVG(100*tv.new_vaccinations/pct.population) vaccination_rate
+FROM present_country_totals pct
+INNER JOIN tests_vaccinations tv
+ON pct.location=tv.location AND tv.date BETWEEN '2021-07-10' AND '2021-07-17'
+GROUP BY pct.location
+ORDER BY vaccination_rate DESC;
