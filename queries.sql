@@ -4,6 +4,141 @@
 -- continent name and continent as NULL),
 -- so accessing countries requires 'WHERE continent IS NOT NULL'
 
+-- Queries are generally in decreasing order of complexity
+
+-- UPDATE tests_vaccinations table since some entries for 'people_fully_vaccinated' are NULL 
+-- (which seems meaningless)
+-- NULL entries before vaccinations start are 0, others are latest non-NULL value
+WITH cte AS (
+	SELECT location, date, people_fully_vaccinated,
+	   COALESCE(people_fully_vaccinated,
+				MAX(people_fully_vaccinated) OVER
+					(PARTITION BY location
+					ORDER BY date
+					ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+				0) new
+	FROM tests_vaccinations
+)
+UPDATE tests_vaccinations
+SET tests_vaccinations.people_fully_vaccinated = cte.new
+FROM tests_vaccinations
+	 INNER JOIN cte ON tests_vaccinations.location=cte.location AND tests_vaccinations.date=cte.date;
+
+-- Get weekly vaccination rates (wrt population) for each country
+WITH cte AS (
+	SELECT tv.location, tv.population, DATEPART(week,tv.date) week,
+		   tv.people_fully_vaccinated - 
+		   LEAD(tv.people_fully_vaccinated,1) OVER (PARTITION BY tv.location ORDER BY tv.date DESC) newly_vaccinated_people
+	FROM tests_vaccinations tv
+	WHERE tv.continent IS NOT NULL --AND tv.location LIKE '%states'
+)
+SELECT DISTINCT location, week,
+	   ROUND(100*SUM(newly_vaccinated_people/population) OVER (PARTITION BY location,week),3) weekly_vaccination_rate
+FROM cte
+WHERE week BETWEEN 1 AND 30
+ORDER BY location;
+
+-- Get vaccination rates (wrt population) for each country between '2021-07-10' and '2021-07-17'
+WITH cte AS (
+	SELECT tv.location, tv.date, tv.population, 
+	   tv.people_fully_vaccinated - 
+	   LEAD(tv.people_fully_vaccinated,1) OVER (PARTITION BY tv.location ORDER BY date DESC) AS people_newly_vaccinated
+	FROM tests_vaccinations tv
+	WHERE date BETWEEN '2021-07-10' and '2021-07-17' AND tv.continent IS NOT NULL
+)
+SELECT DISTINCT location, population,
+	   ROUND(100*SUM(people_newly_vaccinated/cte.population) OVER (PARTITION BY cte.location),4) vaccination_rate
+FROM cte
+ORDER BY vaccination_rate DESC;
+
+-- Get vaccination rates of each country (wrt population) over week of '2021-07-10' -> '2021-07-17'
+WITH cte AS (
+	SELECT DISTINCT pct.location,
+		   AVG(100*ISNULL(tv.new_vaccinations,0)/pct.population) vaccination_rate
+	FROM present_country_totals pct
+	INNER JOIN tests_vaccinations tv
+	ON pct.location=tv.location AND tv.date BETWEEN '2021-07-10' AND '2021-07-17'
+	GROUP BY pct.location, date
+	ORDER BY vaccination_rate DESC
+)
+SELECT *
+FROM cte
+WHERE vaccination_rate IS NOT NULL;
+
+-- Get number of newly vaccinated people every day per country
+SELECT tv.location, tv.date, tv.people_fully_vaccinated, 
+	   tv.people_fully_vaccinated - 
+	   LEAD(tv.people_fully_vaccinated,1) OVER (PARTITION BY tv.location ORDER BY date DESC) AS people_newly_vaccinated
+FROM tests_vaccinations tv
+ORDER BY tv.location, tv.date;
+
+-- Getting percentages of people vaccinated per country
+SELECT pct.location, 
+	   ROUND(100*ISNULL(tv.people_fully_vaccinated,0)/pct.population,4) percent_vaccinated
+FROM present_country_totals pct
+	INNER JOIN tests_vaccinations tv
+	ON pct.location=tv.location AND tv.date='2021-07-17'
+ORDER BY percent_vaccinated DESC;
+GO
+
+-- Create a view of present_country_totals, since this query can be used elsewhere
+-- Also, replace all NULL values with 0's, since we want this table to be of totals
+CREATE VIEW present_country_totals AS
+	SELECT cd.location, cd.continent,
+		   AVG(cd.population) population,
+		   ISNULL(MAX(cd.total_cases),0) total_cases, 
+		   ISNULL(MAX(cd.total_deaths),0) total_deaths,
+		   ISNULL(MAX(tv.total_tests),0) total_tests, 
+		   MAX(tv.people_fully_vaccinated) total_vaccinations
+	FROM cases_deaths cd
+		INNER JOIN tests_vaccinations tv 
+		ON cd.location=tv.location AND cd.date=tv.date
+	WHERE cd.continent IS NOT NULL
+	GROUP BY cd.location, cd.continent
+	ORDER BY total_cases DESC, total_deaths DESC
+	OFFSET 0 ROWS;
+GO
+
+-- Get total population, cases, deaths, tests, vaccinations for each *continent* as of 2021-07-17
+-- Also get totals as percentages of population
+WITH cte AS (
+	SELECT continent, 
+		   SUM(population) population,
+		   SUM(total_cases) total_cases, 
+		   SUM(total_deaths) total_deaths,
+		   SUM(total_tests) total_tests, 
+		   SUM(total_vaccinations) total_vaccinations
+	FROM present_country_totals
+	GROUP BY continent
+) 
+SELECT *, 
+       ROUND(100*cte.total_cases/cte.population,4) percent_cases,
+	   ROUND(100*cte.total_deaths/cte.population,4) percent_deaths,
+	   ROUND(100*cte.total_tests/cte.population,4) percent_tests,
+	   ROUND(100*cte.total_vaccinations/cte.population,4) percent_vaccinations
+FROM cte
+ORDER BY continent;
+GO
+
+-- Calculate world totals directly from source tables
+WITH cte AS (
+	SELECT DISTINCT location, population 
+	FROM cases_deaths
+	WHERE cases_deaths.continent IS NOT NULL
+)
+SELECT 'World' World,
+	   SUM(DISTINCT cte.population) total_population,
+	   SUM(cd.new_cases) total_cases,
+	   SUM(cd.new_deaths) total_deaths,
+	   SUM(tv.new_tests) total_tests,
+	   SUM(tv.new_vaccinations) total_vaccinations
+FROM cases_deaths cd
+	INNER JOIN tests_vaccinations tv
+	ON cd.location=tv.location AND cd.date=tv.date
+	INNER JOIN cte ON cd.location=cte.location
+WHERE cd.continent IS NOT NULL;
+GO
+
 -- Get present_cases and present_deaths for each country
 SELECT location, MAX(total_cases) total_cases, MAX(total_deaths) total_deaths
 FROM cases_deaths
@@ -39,23 +174,7 @@ WHERE total_deaths IS NOT NULL AND continent IS NOT NULL
 ORDER BY location, date;
 GO
 
--- First create a view of present_country_totals, since this query can be used elsewhere
--- Also, replace all NULL values with 0's, since we want this table to be of totals
-CREATE VIEW present_country_totals AS
-	SELECT cd.location, cd.continent,
-		   AVG(cd.population) population,
-		   ISNULL(MAX(cd.total_cases),0) total_cases, 
-		   ISNULL(MAX(cd.total_deaths),0) total_deaths,
-		   ISNULL(MAX(tv.total_tests),0) total_tests, 
-		   ISNULL(MAX(tv.total_vaccinations),0) total_vaccinations
-	FROM cases_deaths cd
-		INNER JOIN tests_vaccinations tv 
-		ON cd.location=tv.location AND cd.date=tv.date
-	WHERE cd.continent IS NOT NULL
-	GROUP BY cd.location, cd.continent
-	ORDER BY total_cases DESC, total_deaths DESC
-	OFFSET 0 ROWS;
-GO
+
 -- Gets total_cases, total_deaths for each country as of 2021-07-19
 -- Note total_vaccinations counts shots (e.g. Pfizer has 2 shots per vaccine),
 -- since many countries (e.g., US) have more vaccinations than populants
@@ -63,51 +182,11 @@ GO
 -- Also note any query which uses present_country_totals is equivalent to a similar query from
 -- the source table(s) where the SELECT statement for present_country_totals defines a CTE
 
--- Get total population, cases, deaths, tests, vaccinations for each continent as of 2021-07-17
--- Also get totals as percentages of population
-WITH cte AS (
-	SELECT continent, 
-		   SUM(population) population,
-		   SUM(total_cases) total_cases, 
-		   SUM(total_deaths) total_deaths,
-		   SUM(total_tests) total_tests, 
-		   SUM(total_vaccinations) total_vaccinations
-	FROM present_country_totals
-	GROUP BY continent
-) 
-SELECT *, 
-       ROUND(100*cte.total_cases/cte.population,4) percent_cases,
-	   ROUND(100*cte.total_deaths/cte.population,4) percent_deaths,
-	   ROUND(100*cte.total_tests/cte.population,4) percent_tests,
-	   ROUND(100*cte.total_vaccinations/cte.population,4) percent_vaccinations
-FROM cte
-ORDER BY continent;
-GO
-
 -- Create view for world totals
 SELECT 'World' World, SUM(population) population,
 		SUM(total_cases) total_cases, SUM(total_deaths) total_deaths,
 		SUM(total_tests) total_tests, SUM(total_vaccinations) total_vaccinations
 FROM present_country_totals;
-GO
-
--- Can also calculate world totals directly from source tables
-WITH cte AS (
-	SELECT DISTINCT location, population 
-	FROM cases_deaths
-	WHERE cases_deaths.continent IS NOT NULL
-)
-SELECT 'World' World,
-	   SUM(DISTINCT cte.population) total_population,
-	   SUM(cd.new_cases) total_cases,
-	   SUM(cd.new_deaths) total_deaths,
-	   SUM(tv.new_tests) total_tests,
-	   SUM(tv.new_vaccinations) total_vaccinations
-FROM cases_deaths cd
-	INNER JOIN tests_vaccinations tv
-	ON cd.location=tv.location AND cd.date=tv.date
-	INNER JOIN cte ON cd.location=cte.location
-WHERE cd.continent IS NOT NULL;
 GO
 
 -- Calculate percentage of world totals per country (e.g., what % of cases are from the US) using country_totals table
@@ -131,19 +210,3 @@ SELECT location, population,
 	   ROUND(100*total_vaccinations/population,4) vaccination_percentage
 FROM present_country_totals
 ORDER BY infection_percentage DESC, death_percentage DESC;
-
--- Getting percentages of people vaccinated per country
-SELECT pct.location, ROUND(100*tv.people_fully_vaccinated/pct.population,4) percent_vaccinated
-FROM present_country_totals pct
-	INNER JOIN tests_vaccinations tv
-	ON pct.location=tv.location AND tv.date='2021-07-17'
-ORDER BY percent_vaccinated DESC;
-
--- Get vaccination rates of each country (wrt population) over week of '2021-07-10' -> '2021-07-17'
-SELECT pct.location,
-	   AVG(100*tv.new_vaccinations/pct.population) vaccination_rate
-FROM present_country_totals pct
-INNER JOIN tests_vaccinations tv
-ON pct.location=tv.location AND tv.date BETWEEN '2021-07-10' AND '2021-07-17'
-GROUP BY pct.location
-ORDER BY vaccination_rate DESC;
